@@ -33,6 +33,7 @@
 
 #define LOG_TAG "vendor.qti.vibrator"
 
+#include <cutils/properties.h>
 #include <dirent.h>
 #include <inttypes.h>
 #include <linux/input.h>
@@ -49,10 +50,6 @@
 #ifdef USE_EFFECT_STREAM
 #include "effect.h"
 #endif
-
-extern "C" {
-#include "libsoc_helper.h"
-}
 
 namespace aidl {
 namespace android {
@@ -71,6 +68,20 @@ namespace vibrator {
 #define VIB_AW   0x02
 
 #define VIB_ALL (VIB_LED|VIB_AW)
+
+#define MSM_CPU_LAHAINA         415
+#define APQ_CPU_LAHAINA         439
+#define MSM_CPU_SHIMA           450
+#define MSM_CPU_SM8325          501
+#define APQ_CPU_SM8325P         502
+#define MSM_CPU_YUPIK           475
+#define MSM_CPU_CAPE            530
+#define APQ_CPU_CAPE            531
+#define MSM_CPU_TARO            457
+#define MSM_CPU_TARO_LTE        552
+#define MSM_CPU_KALAMA          519
+#define MSM_CPU_PINEAPPLE       557
+
 #define test_bit(bit, array)    ((array)[(bit)/8] & (1<<((bit)%8)))
 
 static const char LED_DEVICE[] = "/sys/class/leds/vibrator";
@@ -87,13 +98,14 @@ enum composeEvent {
 InputFFDevice::InputFFDevice()
 {
     DIR *dp;
+    FILE *fp = NULL;
     struct dirent *dir;
     uint8_t ffBitmask[FF_CNT / 8];
     char devicename[PATH_MAX];
     const char *INPUT_DIR = "/dev/input/";
     char name[NAME_BUF_SIZE];
     int fd, ret;
-    soc_info_v0_1_t soc;
+    int soc = property_get_int32("ro.vendor.qti.soc_id", -1);
 
     mVibraFd = INVALID_VALUE;
     mSupportGain = false;
@@ -152,11 +164,17 @@ InputFFDevice::InputFFDevice()
             if (test_bit(FF_GAIN, ffBitmask))
                 mSupportGain = true;
 
-            get_soc_info(&soc);
-            ALOGD("msm CPU SoC ID: %d\n", soc.msm_cpu);
-            switch (soc.msm_cpu) {
-            case MSM_CPU_KALAMA:
-            case MSM_CPU_PINEAPPLE:
+            if (soc <= 0 && (fp = fopen("/sys/devices/soc0/soc_id", "r")) != NULL) {
+                fscanf(fp, "%u", &soc);
+                fclose(fp);
+            }
+            switch (soc) {
+            case MSM_CPU_LAHAINA:
+            case APQ_CPU_LAHAINA:
+            case MSM_CPU_SHIMA:
+            case MSM_CPU_SM8325:
+            case APQ_CPU_SM8325P:
+            case MSM_CPU_YUPIK:
                 mSupportExternalControl = true;
                 break;
             default:
