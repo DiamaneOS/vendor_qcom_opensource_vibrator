@@ -70,7 +70,7 @@ namespace vibrator {
 
 #define test_bit(bit, array)    ((array)[(bit)/8] & (1<<((bit)%8)))
 
-static const char LED_DEVICE[] = "/sys/class/leds/vibrator";
+static const char LED_DEVICE[] = "/sys/class/leds/aw_vibrator";
 static const char HAPTICS_SYSFS[] = "/sys/class/qcom-haptics";
 
 static constexpr int32_t ComposeDelayMaxMs = 1000;
@@ -421,6 +421,11 @@ int LedVibratorDevice::on(int32_t timeoutMs) {
        goto error;
 
     snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "activate");
+    ret = write_value(file, "1");
+    if (ret < 0)
+       goto error;
+
+   snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "index");
     ret = write_value(file, "1");
     if (ret < 0)
        goto error;
