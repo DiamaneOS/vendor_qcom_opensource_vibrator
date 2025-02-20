@@ -67,11 +67,15 @@ namespace vibrator {
 #define NAME_BUF_SIZE           32
 #define PRIMITIVE_ID_MASK       0x8000
 #define MAX_PATTERN_ID          32767
+#define VIB_LED  0x01
+#define VIB_AW   0x02
 
+#define VIB_ALL (VIB_LED|VIB_AW)
 #define test_bit(bit, array)    ((array)[(bit)/8] & (1<<((bit)%8)))
 
-static const char LED_DEVICE[] = "/sys/class/leds/aw_vibrator";
+static const char LED_DEVICE[] = "/sys/class/leds/vibrator";
 static const char HAPTICS_SYSFS[] = "/sys/class/qcom-haptics";
+static const char AW_DEVICE[] = "/sys/class/leds/aw_vibrator";
 
 static constexpr int32_t ComposeDelayMaxMs = 1000;
 static constexpr int32_t ComposeSizeMax = 256;
@@ -364,14 +368,26 @@ LedVibratorDevice::LedVibratorDevice() {
     int fd;
 
     mDetected = false;
+    vibrator_dev = VIB_ALL;
 
     snprintf(devicename, sizeof(devicename), "%s/%s", LED_DEVICE, "activate");
     fd = TEMP_FAILURE_RETRY(open(devicename, O_RDWR));
     if (fd < 0) {
-        ALOGE("open %s failed, errno = %d", devicename, errno);
-        return;
+        ALOGE("vibrator open %s failed, errno = %d", devicename, errno);
+        vibrator_dev &= ~ VIB_LED;
+ //       return;
     }
 
+   snprintf(devicename, sizeof(devicename), "%s/%s", AW_DEVICE, "activate");
+    fd = TEMP_FAILURE_RETRY(open(devicename, O_RDWR));
+    if (fd < 0) {
+        ALOGE("vibrator open %s failed, errno = %d", devicename, errno);
+        vibrator_dev &= ~ VIB_AW;
+    }
+    ALOGE("vibrator device = %d", vibrator_dev);
+    if(!vibrator_dev)
+        return;
+    ALOGE("vibrator true");
     mDetected = true;
 }
 
@@ -408,6 +424,75 @@ int LedVibratorDevice::on(int32_t timeoutMs) {
     char file[PATH_MAX];
     char value[32];
     int ret;
+    ALOGD("AwVibrator on time = %d ",timeoutMs);
+    if(vibrator_dev & VIB_AW)
+    {
+        ALOGD("AwVibrator time = %d ",timeoutMs);
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "activate_mode");
+        ret = write_value(file, "0");
+        if (ret < 0)
+            goto error;
+
+	if (timeoutMs <= 50) {
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "seq");
+        ret = write_value(file, "0x00 0x00");
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "seq");
+        ret = write_value(file, "0x00 0x01");
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "loop");
+        ret = write_value(file, "0x00 0x00");
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "duration");
+        snprintf(value, sizeof(value), "%u\n", timeoutMs);
+        ret = write_value(file, value);
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "gain");
+        ret = write_value(file, "0x80");
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "brightness");
+        ret = write_value(file, "1");
+        if (ret < 0)
+            goto error;
+
+        return 0;
+
+	} else {
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "index");
+        ret = write_value(file, "4");
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "duration");
+        snprintf(value, sizeof(value), "%u\n", timeoutMs);
+        ret = write_value(file, value);
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "gain");
+        ret = write_value(file, "0x55");
+        if (ret < 0)
+            goto error;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "activate");
+        ret = write_value(file, "1");
+        if (ret < 0)
+            goto error;
+
+        return 0;
+	}
+    }
 
     snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "state");
     ret = write_value(file, "1");
@@ -425,11 +510,6 @@ int LedVibratorDevice::on(int32_t timeoutMs) {
     if (ret < 0)
        goto error;
 
-   snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "index");
-    ret = write_value(file, "1");
-    if (ret < 0)
-       goto error;
-
     return 0;
 
 error:
@@ -441,6 +521,25 @@ int LedVibratorDevice::off()
 {
     char file[PATH_MAX];
     int ret;
+    ALOGD("LedVibrator device = %d ",vibrator_dev);
+    if(vibrator_dev & VIB_AW)
+    {
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "activate");
+        ret = write_value(file, "0");
+
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "brightness");
+        ret = write_value(file, "0");
+        if (ret < 0)
+            return ret;
+
+        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "index");
+        ret = write_value(file, "1");
+        if (ret < 0)
+            return ret;
+
+        return ret;
+    }
 
     snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "activate");
     ret = write_value(file, "0");
