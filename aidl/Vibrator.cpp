@@ -456,11 +456,6 @@ int LedVibratorDevice::on(int32_t timeoutMs) {
         if (ret < 0)
             goto error;
 
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "gain");
-        ret = write_value(file, "0x80");
-        if (ret < 0)
-            goto error;
-
         snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "brightness");
         ret = write_value(file, "1");
         if (ret < 0)
@@ -477,11 +472,6 @@ int LedVibratorDevice::on(int32_t timeoutMs) {
         snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "duration");
         snprintf(value, sizeof(value), "%u\n", timeoutMs);
         ret = write_value(file, value);
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "gain");
-        ret = write_value(file, "0x55");
         if (ret < 0)
             goto error;
 
