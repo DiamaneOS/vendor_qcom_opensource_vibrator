@@ -298,7 +298,6 @@ int InputFFDevice::off() {
 int InputFFDevice::setAmplitude(uint8_t amplitude) {
     int tmp, ret;
     struct input_event ie;
-
     /* For QMAA compliance, return OK even if vibrator device doesn't exist */
     if (mVibraFd == INVALID_VALUE)
         return 0;
@@ -419,6 +418,38 @@ int LedVibratorDevice::write_value(const char *file, const char *value) {
 
     return ret;
 }
+
+static int write_aw_value(const char *file, const char *value) {
+    int fd;
+    int ret;
+
+    fd = TEMP_FAILURE_RETRY(open(file, O_WRONLY));
+    if (fd < 0) {
+        ALOGE("open %s failed, errno = %d", file, errno);
+        return -errno;
+    }
+
+    ret = TEMP_FAILURE_RETRY(write(fd, value, strlen(value) + 1));
+    if (ret == -1) {
+        ret = -errno;
+    } else if (ret != strlen(value) + 1) {
+        /* even though EAGAIN is an errno value that could be set
+           by write() in some cases, none of them apply here.  So, this return
+           value can be clearly identified when debugging and suggests the
+           caller that it may try to call vibrator_on() again */
+        ret = -EAGAIN;
+    } else {
+        ret = 0;
+    }
+
+    errno = 0;
+    close(fd);
+
+    return ret;
+}
+
+
+
 
 int LedVibratorDevice::on(int32_t timeoutMs) {
     char file[PATH_MAX];
@@ -662,9 +693,31 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs,
 ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es, const std::shared_ptr<IVibratorCallback>& callback, int32_t* _aidl_return) {
     long playLengthMs;
     int ret;
-
-    if (ledVib.mDetected)
+    
+    char file[PATH_MAX];
+    char value[32];
+    ALOGD("Vibrator perform EffectStrength %d", es);
+    if (ledVib.mDetected){
+        if(ledVib.vibrator_dev & VIB_AW) {
+            ALOGD(" Vibrator::perform");
+            snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "gain");
+            switch (es) {
+                case EffectStrength::LIGHT:
+                     write_aw_value(file, "0x10");
+                     break;
+                case EffectStrength::MEDIUM:
+                     write_aw_value(file, "0x45");
+                     break;   
+                case EffectStrength::STRONG:
+                     write_aw_value(file, "0x80");
+                     break;
+                default:
+                     write_aw_value(file, "0x80");
+                     break;
+                }
+        }
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+    }
 
     ALOGD("Vibrator perform effect %d", effect);
     if (Offload.mEnabled == 1) {
