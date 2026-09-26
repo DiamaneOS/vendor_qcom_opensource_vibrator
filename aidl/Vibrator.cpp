@@ -34,6 +34,9 @@
 #define LOG_TAG "vendor.qti.vibrator"
 
 #include <cutils/properties.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <dirent.h>
 #include <inttypes.h>
 #include <linux/input.h>
@@ -91,6 +94,114 @@ static const char AW_DEVICE[] = "/sys/class/leds/aw_vibrator";
 static constexpr int32_t ComposeDelayMaxMs = 1000;
 static constexpr int32_t ComposeSizeMax = 256;
 
+/*
+ * Awinic haptics (aw_vibrator, e.g. FP6). Effects play the fixed waveforms in
+ * the chip RAM (/vendor/firmware/haptic_ram.bin, 24 kHz, f0 ~234 Hz); RTP
+ * (streamed waveforms) is not used.
+ *   wave 1: 29.8 ms (~7 cycles)    wave 2: 22.2 ms (~5 cycles)
+ *   wave 3: 14.5 ms (~3.5 cycles)  wave 4:  4.3 ms (one cycle, looped by on())
+ * Gain is the chip's digital gain, 0x01..AW_GAIN_MAX (0x80 = full scale).
+ */
+#define AW_RAM_WAVE_NUM         4
+#define AW_LOOP_WAVE            4
+#define AW_GAIN_MAX             0x80
+/* The driver starts a waveform from its work queue, a few ms after the trigger */
+#define AW_TRIGGER_MARGIN_MS    5
+/*
+ * on() up to this long plays one RAM waveform, longer ones loop AW_LOOP_WAVE.
+ * Any positive on() length is accepted, as before: the driver timer takes an
+ * int of ms and the HAL stops the loop at the end as well.
+ */
+#define AW_SHORT_ON_MAX_MS      50
+
+/* Waveform lengths in ms, rounded up; index 0 = no waveform */
+static constexpr int32_t kAwWaveMs[AW_RAM_WAVE_NUM + 1] = { 0, 30, 23, 15, 5 };
+
+/*
+ * Tuning table, set by the owner's feel test on the FP6 (2026-09-26): wave 3 is
+ * the tick (light 0x18 for slider steps, medium 0x40 for the keyboard); waves 2
+ * and 1 feel alike and wave 1 at full gain feels cheap, so clicks, heavy clicks
+ * and thuds use wave 2 and wave 1 is not used for taps.
+ * Adjust by feel: the RAM waveform each effect plays and its gain
+ * for EffectStrength LIGHT, MEDIUM and STRONG (touch feedback follows the
+ * user's vibration intensity setting; MEDIUM is the default). repeatGapMs > 0
+ * plays the waveform again after that much silence.
+ * Composition primitives use the second table: gain = scale * fullGain.
+ */
+struct AwEffect {
+    Effect effect;
+    uint8_t wave;
+    uint8_t gain[3];
+    int32_t repeatGapMs;
+};
+
+static constexpr AwEffect kAwEffects[] = {
+    /* effect                wave   LIGHT MEDIUM STRONG   repeatGapMs */
+    { Effect::TICK,            3, { 0x18, 0x40, 0x80 },   0 },
+    { Effect::TEXTURE_TICK,    3, { 0x18, 0x28, 0x38 },   0 },
+    { Effect::CLICK,           2, { 0x20, 0x30, 0x60 },   0 },
+    { Effect::POP,             2, { 0x20, 0x30, 0x48 },   0 },
+    { Effect::HEAVY_CLICK,     2, { 0x50, 0x68, 0x80 },   0 },
+    { Effect::THUD,            2, { 0x40, 0x58, 0x70 },   0 },
+    { Effect::DOUBLE_CLICK,    2, { 0x20, 0x30, 0x60 }, 100 },
+};
+
+struct AwPrimitive {
+    CompositePrimitive primitive;
+    uint8_t wave;
+    uint8_t fullGain;
+};
+
+static constexpr AwPrimitive kAwPrimitives[] = {
+    /* primitive                       wave  fullGain */
+    { CompositePrimitive::NOOP,          0,  0x00 },
+    /* The keyboard composes CLICK at config_keyboardHapticFeedbackFixedAmplitude
+       (0.5 in the FP6 overlay: 0x40, the medium tick); SystemUI slider steps
+       compose PRIMITIVE_TICK at 0.5 (0x18, the light tick). */
+    { CompositePrimitive::CLICK,         3,  0x80 },
+    { CompositePrimitive::LIGHT_TICK,    3,  0x30 },    /* Java PRIMITIVE_TICK */
+    { CompositePrimitive::LOW_TICK,      3,  0x28 },
+};
+
+static constexpr bool awTablesValid() {
+    for (const AwEffect& e : kAwEffects) {
+        if (e.wave < 1 || e.wave > AW_RAM_WAVE_NUM ||
+            e.repeatGapMs < 0 || e.repeatGapMs > ComposeDelayMaxMs)
+            return false;
+        for (uint8_t g : e.gain)
+            if (g < 1 || g > AW_GAIN_MAX)
+                return false;
+    }
+    for (const AwPrimitive& p : kAwPrimitives) {
+        if (p.wave > AW_RAM_WAVE_NUM || p.fullGain > AW_GAIN_MAX ||
+            (p.wave != 0 && p.fullGain < 1))
+            return false;
+    }
+    return true;
+}
+static_assert(awTablesValid(), "Awinic tuning table out of range");
+
+static const AwEffect *awFindEffect(Effect effect) {
+    for (const AwEffect& e : kAwEffects)
+        if (e.effect == effect)
+            return &e;
+    return nullptr;
+}
+
+static const AwPrimitive *awFindPrimitive(CompositePrimitive primitive) {
+    for (const AwPrimitive& p : kAwPrimitives)
+        if (p.primitive == primitive)
+            return &p;
+    return nullptr;
+}
+
+/* Time a RAM waveform takes from the trigger until it has played out */
+static int32_t awWavePlayMs(uint8_t wave) {
+    if (wave < 1 || wave > AW_RAM_WAVE_NUM)
+        return 0;
+    return kAwWaveMs[wave] + AW_TRIGGER_MARGIN_MS;
+}
+
 enum composeEvent {
     STOP_COMPOSE = 0,
 };
@@ -114,6 +225,19 @@ InputFFDevice::InputFFDevice()
     mCurrAppId = INVALID_VALUE;
     mCurrMagnitude = 0x7fff;
     mInExternalControl = false;
+
+    /*
+     * An Awinic vibrator (FP6) is driven through its sysfs nodes by
+     * LedVibratorDevice, and the input devices are never used. Do not open
+     * them: the probe below opens every one read-write, touchscreen and keys
+     * included, so the service needs neither the input group nor
+     * input_device access.
+     */
+    snprintf(devicename, sizeof(devicename), "%s/%s", AW_DEVICE, "activate");
+    if (access(devicename, F_OK) == 0) {
+        ALOGD("Awinic vibrator present, input devices not probed");
+        return;
+    }
 
     dp = opendir(INPUT_DIR);
     if (!dp) {
@@ -393,6 +517,8 @@ LedVibratorDevice::LedVibratorDevice() {
         ALOGE("vibrator open %s failed, errno = %d", devicename, errno);
         vibrator_dev &= ~ VIB_LED;
  //       return;
+    } else {
+        close(fd);
     }
 
    snprintf(devicename, sizeof(devicename), "%s/%s", AW_DEVICE, "activate");
@@ -400,12 +526,18 @@ LedVibratorDevice::LedVibratorDevice() {
     if (fd < 0) {
         ALOGE("vibrator open %s failed, errno = %d", devicename, errno);
         vibrator_dev &= ~ VIB_AW;
+    } else {
+        close(fd);
     }
     ALOGE("vibrator device = %d", vibrator_dev);
     if(!vibrator_dev)
         return;
     ALOGE("vibrator true");
     mDetected = true;
+
+    /* A restarted service must not leave a vibration from its previous instance running */
+    if (vibrator_dev & VIB_AW)
+        off();
 }
 
 int LedVibratorDevice::write_value(const char *file, const char *value) {
@@ -437,101 +569,127 @@ int LedVibratorDevice::write_value(const char *file, const char *value) {
     return ret;
 }
 
-static int write_aw_value(const char *file, const char *value) {
-    int fd;
+int LedVibratorDevice::aw_write(const char *node, const char *value) {
+    char file[PATH_MAX];
+
+    snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, node);
+    return write_value(file, value);
+}
+
+int LedVibratorDevice::awSetGain(uint8_t gain) {
+    char value[8];
+
+    if (!(vibrator_dev & VIB_AW))
+        return -ENODEV;
+
+    if (gain > AW_GAIN_MAX)
+        gain = AW_GAIN_MAX;
+    snprintf(value, sizeof(value), "0x%02x", gain);
+    return aw_write("gain", value);
+}
+
+/*
+ * Play one RAM waveform once. Writing "brightness" puts the driver in RAM mode
+ * (boost on) and plays sequencer slots from slot 0 until an empty slot; the
+ * chip stops by itself at the end. Every slot used is rewritten here, so an
+ * infinite loop count left in slot 0 by awPlayLoop() cannot carry over (RAM
+ * mode has no driver timer).
+ */
+int LedVibratorDevice::awPlayRam(uint8_t wave, uint8_t gain) {
+    char value[16];
     int ret;
 
-    fd = TEMP_FAILURE_RETRY(open(file, O_WRONLY));
-    if (fd < 0) {
-        ALOGE("open %s failed, errno = %d", file, errno);
-        return -errno;
-    }
+    if (!(vibrator_dev & VIB_AW))
+        return -ENODEV;
+    if (wave < 1 || wave > AW_RAM_WAVE_NUM)
+        return -EINVAL;
 
-    ret = TEMP_FAILURE_RETRY(write(fd, value, strlen(value) + 1));
-    if (ret == -1) {
-        ret = -errno;
-    } else if (ret != strlen(value) + 1) {
-        /* even though EAGAIN is an errno value that could be set
-           by write() in some cases, none of them apply here.  So, this return
-           value can be clearly identified when debugging and suggests the
-           caller that it may try to call vibrator_on() again */
-        ret = -EAGAIN;
-    } else {
-        ret = 0;
-    }
+    ret = awSetGain(gain);
+    if (ret < 0)
+        goto error;
 
-    errno = 0;
-    close(fd);
+    snprintf(value, sizeof(value), "0x00 0x%02x", wave);
+    ret = aw_write("seq", value);
+    if (ret < 0)
+        goto error;
 
+    ret = aw_write("loop", "0x00 0x00");
+    if (ret < 0)
+        goto error;
+
+    /* end of sequence */
+    ret = aw_write("seq", "0x01 0x00");
+    if (ret < 0)
+        goto error;
+
+    ret = aw_write("brightness", "1");
+    if (ret < 0)
+        goto error;
+
+    return 0;
+
+error:
+    ALOGE("AwVibrator failed to play wave %d, ret: %d", wave, ret);
     return ret;
 }
 
+/*
+ * Loop the one-cycle waveform for timeoutMs. Writing "activate" uses the
+ * device tree play mode, RAM loop (mode = 5 on FP6), in which the driver arms
+ * a timer for "duration" and stops the loop when it fires. The caller stops
+ * the motor at the end as well.
+ */
+int LedVibratorDevice::awPlayLoop(int32_t timeoutMs, uint8_t gain) {
+    char value[16];
+    int ret;
 
+    if (!(vibrator_dev & VIB_AW))
+        return -ENODEV;
+    if (timeoutMs <= 0)
+        return -EINVAL;
 
+    ret = awSetGain(gain);
+    if (ret < 0)
+        goto error;
+
+    snprintf(value, sizeof(value), "0x00 0x%02x", AW_LOOP_WAVE);
+    ret = aw_write("seq", value);
+    if (ret < 0)
+        goto error;
+
+    /* 0x0f: repeat until stopped */
+    ret = aw_write("loop", "0x00 0x0f");
+    if (ret < 0)
+        goto error;
+
+    ret = aw_write("seq", "0x01 0x00");
+    if (ret < 0)
+        goto error;
+
+    snprintf(value, sizeof(value), "%d\n", timeoutMs);
+    ret = aw_write("duration", value);
+    if (ret < 0)
+        goto error;
+
+    ret = aw_write("activate", "1");
+    if (ret < 0)
+        goto error;
+
+    return 0;
+
+error:
+    ALOGE("AwVibrator failed to loop for %d ms, ret: %d", timeoutMs, ret);
+    return ret;
+}
 
 int LedVibratorDevice::on(int32_t timeoutMs) {
     char file[PATH_MAX];
     char value[32];
     int ret;
-    ALOGD("AwVibrator on time = %d ",timeoutMs);
-    if(vibrator_dev & VIB_AW)
-    {
-        ALOGD("AwVibrator time = %d ",timeoutMs);
 
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "activate_mode");
-        ret = write_value(file, "0");
-        if (ret < 0)
-            goto error;
-
-	if (timeoutMs <= 50) {
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "seq");
-        ret = write_value(file, "0x00 0x00");
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "seq");
-        ret = write_value(file, "0x00 0x01");
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "loop");
-        ret = write_value(file, "0x00 0x00");
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "duration");
-        snprintf(value, sizeof(value), "%u\n", timeoutMs);
-        ret = write_value(file, value);
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "brightness");
-        ret = write_value(file, "1");
-        if (ret < 0)
-            goto error;
-
-        return 0;
-
-	} else {
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "index");
-        ret = write_value(file, "4");
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "duration");
-        snprintf(value, sizeof(value), "%u\n", timeoutMs);
-        ret = write_value(file, value);
-        if (ret < 0)
-            goto error;
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "activate");
-        ret = write_value(file, "1");
-        if (ret < 0)
-            goto error;
-
-        return 0;
-	}
-    }
+    /* Awinic playback goes through Vibrator::awOn() */
+    if (vibrator_dev & VIB_AW)
+        return -EINVAL;
 
     snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "state");
     ret = write_value(file, "1");
@@ -559,25 +717,25 @@ error:
 int LedVibratorDevice::off()
 {
     char file[PATH_MAX];
-    int ret;
+    int ret, ret2;
     ALOGD("LedVibrator device = %d ",vibrator_dev);
     if(vibrator_dev & VIB_AW)
     {
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "activate");
-        ret = write_value(file, "0");
-
-
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "brightness");
-        ret = write_value(file, "0");
-        if (ret < 0)
+        /*
+         * Either write sets the driver state to 0, and its work then cancels
+         * the loop timer and stops the chip. Both are written so that one
+         * failing still stops the motor. The sequencer is not touched (the
+         * old "index" write here left slot 0 looping forever); awPlayRam()
+         * rewrites every slot it plays before triggering.
+         */
+        ret = aw_write("activate", "0");
+        ret2 = aw_write("brightness", "0");
+        if (ret < 0 && ret2 < 0) {
+            ALOGE("AwVibrator failed to stop, ret: %d %d", ret, ret2);
             return ret;
+        }
 
-        snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "index");
-        ret = write_value(file, "1");
-        if (ret < 0)
-            return ret;
-
-        return ret;
+        return 0;
     }
 
     snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "activate");
@@ -592,6 +750,16 @@ Vibrator::Vibrator() {
     pipefd[0] = INVALID_VALUE;
     pipefd[1] = INVALID_VALUE;
     inComposition = false;
+
+    mAwJob = AwJob();
+    mAwJobQueued = false;
+    mAwGeneration = 0;
+    mAwOnActive = false;
+    mAwStopped = true;      /* LedVibratorDevice() stopped it */
+    mAwAmplitudeGain = AW_GAIN_MAX;
+    mAwExit = false;
+    if (isAw())
+        mAwThread = std::thread(awPlayThread, this);
 
     if (!ff.mSupportEffects)
         return;
@@ -628,6 +796,14 @@ pipefd_close:
 }
 
 Vibrator::~Vibrator() {
+    if (mAwThread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(mAwLock);
+            mAwExit = true;
+        }
+        mAwCv.notify_all();
+        mAwThread.join();
+    }
     if (epollfd != INVALID_VALUE)
         close(epollfd);
     if (pipefd[0] != INVALID_VALUE)
@@ -638,6 +814,13 @@ Vibrator::~Vibrator() {
 
 ndk::ScopedAStatus Vibrator::getCapabilities(int32_t* _aidl_return) {
     *_aidl_return = IVibrator::CAP_ON_CALLBACK;
+
+    if (isAw()) {
+        *_aidl_return |= IVibrator::CAP_PERFORM_CALLBACK | IVibrator::CAP_AMPLITUDE_CONTROL |
+                         IVibrator::CAP_COMPOSE_EFFECTS;
+        ALOGD("QTI Vibrator reporting capabilities: %d", *_aidl_return);
+        return ndk::ScopedAStatus::ok();
+    }
 
     if (ledVib.mDetected) {
         *_aidl_return |= IVibrator::CAP_PERFORM_CALLBACK;
@@ -663,6 +846,9 @@ ndk::ScopedAStatus Vibrator::off() {
     int composeEven = STOP_COMPOSE;
 
     ALOGD("QTI Vibrator off");
+    if (isAw())
+        return awOff();
+
     if (ledVib.mDetected)
         ret = ledVib.off();
     else
@@ -686,6 +872,9 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs,
     int ret;
 
     ALOGD("Vibrator on for timeoutMs: %d", timeoutMs);
+    if (isAw())
+        return awOn(timeoutMs, callback);
+
     if (ledVib.mDetected)
         ret = ledVib.on(timeoutMs);
     else
@@ -711,31 +900,13 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs,
 ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es, const std::shared_ptr<IVibratorCallback>& callback, int32_t* _aidl_return) {
     long playLengthMs;
     int ret;
-    
-    char file[PATH_MAX];
-    char value[32];
+
     ALOGD("Vibrator perform EffectStrength %d", es);
-    if (ledVib.mDetected){
-        if(ledVib.vibrator_dev & VIB_AW) {
-            ALOGD(" Vibrator::perform");
-            snprintf(file, sizeof(file), "%s/%s", AW_DEVICE, "gain");
-            switch (es) {
-                case EffectStrength::LIGHT:
-                     write_aw_value(file, "0x10");
-                     break;
-                case EffectStrength::MEDIUM:
-                     write_aw_value(file, "0x45");
-                     break;   
-                case EffectStrength::STRONG:
-                     write_aw_value(file, "0x80");
-                     break;
-                default:
-                     write_aw_value(file, "0x80");
-                     break;
-                }
-        }
+    if (isAw())
+        return awPerform(effect, es, callback, _aidl_return);
+
+    if (ledVib.mDetected)
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
-    }
 
     ALOGD("Vibrator perform effect %d", effect);
     if (Offload.mEnabled == 1) {
@@ -770,6 +941,13 @@ ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es, const std
 }
 
 ndk::ScopedAStatus Vibrator::getSupportedEffects(std::vector<Effect>* _aidl_return) {
+    if (isAw()) {
+        _aidl_return->clear();
+        for (const AwEffect& e : kAwEffects)
+            _aidl_return->push_back(e.effect);
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (ledVib.mDetected)
         return ndk::ScopedAStatus::ok();
 
@@ -787,6 +965,9 @@ ndk::ScopedAStatus Vibrator::getSupportedEffects(std::vector<Effect>* _aidl_retu
 ndk::ScopedAStatus Vibrator::setAmplitude(float amplitude) {
     uint8_t tmp;
     int ret;
+
+    if (isAw())
+        return awSetAmplitude(amplitude);
 
     if (ledVib.mDetected)
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
@@ -830,6 +1011,13 @@ ndk::ScopedAStatus Vibrator::getCompositionSizeMax(int32_t* maxSize) {
 }
 
 ndk::ScopedAStatus Vibrator::getSupportedPrimitives(std::vector<CompositePrimitive>* supported) {
+    if (isAw()) {
+        supported->clear();
+        for (const AwPrimitive& p : kAwPrimitives)
+            supported->push_back(p.primitive);
+        return ndk::ScopedAStatus::ok();
+    }
+
     *supported =  {
         CompositePrimitive::NOOP,   CompositePrimitive::CLICK,
         CompositePrimitive::THUD,   CompositePrimitive::SPIN,
@@ -905,6 +1093,16 @@ ndk::ScopedAStatus Vibrator::getPrimitiveDuration(CompositePrimitive primitive,
                                                   int32_t* durationMs) {
     uint32_t primitive_id = static_cast<uint32_t>(primitive);
     int ret = 0;
+
+    if (isAw()) {
+        const AwPrimitive *p = awFindPrimitive(primitive);
+
+        if (p == nullptr)
+            return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+        *durationMs = awWavePlayMs(p->wave);
+        ALOGD("primitive-%d duration is %dms", static_cast<int>(primitive), *durationMs);
+        return ndk::ScopedAStatus::ok();
+    }
 
 #ifdef USE_EFFECT_STREAM
     primitive_id |= PRIMITIVE_ID_MASK ;
@@ -1011,6 +1209,9 @@ ndk::ScopedAStatus Vibrator::compose(const std::vector<CompositeEffect>& composi
     int status, nfd = 0, durationMs = 0, timeoutMs = 0;
     struct epoll_event events;
 
+    if (isAw())
+        return awCompose(composite, callback);
+
     if (composite.size() > ComposeSizeMax) {
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
     }
@@ -1068,6 +1269,293 @@ ndk::ScopedAStatus Vibrator::compose(const std::vector<CompositeEffect>& composi
     composeThread.detach();
 
     ALOGD("trigger composition successfully");
+    return ndk::ScopedAStatus::ok();
+}
+
+bool Vibrator::isAw() {
+    return ledVib.mDetected && (ledVib.vibrator_dev & VIB_AW);
+}
+
+/*
+ * Awinic playback: every request (on, perform, compose) becomes a job of
+ * steps that awPlayThread plays and times. A new job or off() bumps
+ * mAwGeneration, which ends the current job at its next wait; that job then
+ * stops the motor and reports completion. All aw sysfs writes happen under
+ * mAwLock, so a trigger can never land after the off() that should stop it.
+ */
+void Vibrator::awSubmit(AwJob& job) {
+    std::shared_ptr<IVibratorCallback> superseded;
+
+    {
+        std::lock_guard<std::mutex> lock(mAwLock);
+        /* a queued job that never started still gets its completion */
+        if (mAwJobQueued)
+            superseded = mAwJob.callback;
+        mAwJob = std::move(job);
+        mAwJobQueued = true;
+        mAwGeneration++;
+    }
+    mAwCv.notify_all();
+
+    if (superseded != nullptr && !superseded->onComplete().isOk())
+        ALOGE("Failed to call onComplete");
+}
+
+void Vibrator::awPlayThread(Vibrator *vibrator) {
+    std::unique_lock<std::mutex> lock(vibrator->mAwLock);
+
+    while (!vibrator->mAwExit) {
+        if (!vibrator->mAwJobQueued) {
+            vibrator->mAwCv.wait(lock);
+            continue;
+        }
+
+        AwJob job = std::move(vibrator->mAwJob);
+        vibrator->mAwJob = AwJob();
+        vibrator->mAwJobQueued = false;
+        uint64_t generation = vibrator->mAwGeneration;
+        auto cancelled = [vibrator, generation] {
+            return vibrator->mAwExit || vibrator->mAwGeneration != generation;
+        };
+        bool interrupted = false;
+        int ret;
+
+        for (const AwStep& step : job.steps) {
+            if (step.delayMs > 0 &&
+                vibrator->mAwCv.wait_for(lock, std::chrono::milliseconds(step.delayMs),
+                                         cancelled)) {
+                interrupted = true;
+                break;
+            }
+            if (cancelled()) {
+                interrupted = true;
+                break;
+            }
+
+            if (step.wave != 0) {
+                uint8_t gain = job.useAmplitude ? vibrator->mAwAmplitudeGain : step.gain;
+
+                vibrator->mAwStopped = false;
+                if (step.loop)
+                    ret = vibrator->ledVib.awPlayLoop(step.lengthMs, gain);
+                else
+                    ret = vibrator->ledVib.awPlayRam(step.wave, gain);
+                if (ret < 0) {
+                    interrupted = true;
+                    break;
+                }
+                vibrator->mAwOnActive = job.useAmplitude;
+            }
+
+            if (step.lengthMs > 0 &&
+                vibrator->mAwCv.wait_for(lock, std::chrono::milliseconds(step.lengthMs),
+                                         cancelled)) {
+                interrupted = true;
+                break;
+            }
+        }
+        vibrator->mAwOnActive = false;
+
+        /*
+         * A job cut short (a newer request, a failed write) may leave a
+         * waveform playing, and a loop is stopped here besides the driver
+         * timer. A RAM sequence that played to its end has already stopped;
+         * after off() the motor is stopped already.
+         */
+        if ((interrupted || job.stopAtEnd) && !vibrator->mAwStopped) {
+            vibrator->ledVib.off();
+            vibrator->mAwStopped = true;
+        }
+
+        if (job.callback != nullptr) {
+            lock.unlock();
+            ALOGD("Notifying aw playback complete");
+            if (!job.callback->onComplete().isOk())
+                ALOGE("Failed to call onComplete");
+            lock.lock();
+        }
+    }
+}
+
+ndk::ScopedAStatus Vibrator::awOff() {
+    std::shared_ptr<IVibratorCallback> dropped;
+    int ret;
+
+    {
+        std::lock_guard<std::mutex> lock(mAwLock);
+        if (mAwJobQueued) {
+            dropped = mAwJob.callback;
+            mAwJob = AwJob();
+            mAwJobQueued = false;
+        }
+        mAwGeneration++;
+        mAwOnActive = false;
+        /* always written, whatever the HAL believes the motor is doing */
+        ret = ledVib.off();
+        mAwStopped = true;
+    }
+    mAwCv.notify_all();
+
+    if (dropped != nullptr && !dropped->onComplete().isOk())
+        ALOGE("Failed to call onComplete");
+
+    if (ret != 0)
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
+    return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Vibrator::awOn(int32_t timeoutMs,
+                                  const std::shared_ptr<IVibratorCallback>& callback) {
+    static const uint8_t shortWaves[] = { 3, 2 };    /* shortest first; wave 1 feels cheap */
+    AwStep step = {};
+    AwJob job;
+
+    if (timeoutMs <= 0)
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
+
+    if (timeoutMs <= AW_SHORT_ON_MAX_MS) {
+        /*
+         * A short pulse plays the shortest RAM waveform that covers it, or
+         * wave 2 above its length (boost mode, crisper than a few looped
+         * cycles). Completion is reported once both the request and the
+         * waveform are over.
+         */
+        step.wave = 2;
+        for (uint8_t wave : shortWaves) {
+            if (kAwWaveMs[wave] >= timeoutMs) {
+                step.wave = wave;
+                break;
+            }
+        }
+        step.lengthMs = std::max(timeoutMs, awWavePlayMs(step.wave));
+    } else {
+        step.wave = AW_LOOP_WAVE;
+        step.loop = true;
+        step.lengthMs = timeoutMs;
+    }
+
+    job.steps.push_back(step);
+    job.useAmplitude = true;
+    job.stopAtEnd = step.loop;
+    job.callback = callback;
+    ALOGD("AwVibrator on %d ms: wave %d%s", timeoutMs, step.wave, step.loop ? " looped" : "");
+    awSubmit(job);
+
+    return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Vibrator::awPerform(Effect effect, EffectStrength es,
+                                       const std::shared_ptr<IVibratorCallback>& callback,
+                                       int32_t* _aidl_return) {
+    const AwEffect *e = awFindEffect(effect);
+    AwStep step = {};
+    AwJob job;
+    int32_t lengthMs = 0;
+    int strength;
+
+    if (e == nullptr)
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+
+    switch (es) {
+    case EffectStrength::LIGHT:
+        strength = 0;
+        break;
+    case EffectStrength::MEDIUM:
+        strength = 1;
+        break;
+    case EffectStrength::STRONG:
+        strength = 2;
+        break;
+    default:
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+    }
+
+    step.wave = e->wave;
+    step.gain = e->gain[strength];
+    step.lengthMs = awWavePlayMs(e->wave);
+    job.steps.push_back(step);
+    if (e->repeatGapMs > 0) {
+        step.delayMs = e->repeatGapMs;
+        job.steps.push_back(step);
+    }
+    for (const AwStep& s : job.steps)
+        lengthMs += s.delayMs + s.lengthMs;
+
+    job.useAmplitude = false;
+    job.stopAtEnd = false;
+    job.callback = callback;
+    ALOGD("AwVibrator perform effect %d strength %d: wave %d gain 0x%02x, %d ms",
+          static_cast<int>(effect), static_cast<int>(es), step.wave, step.gain, lengthMs);
+    awSubmit(job);
+
+    *_aidl_return = lengthMs;
+    return ndk::ScopedAStatus::ok();
+}
+
+ndk::ScopedAStatus Vibrator::awSetAmplitude(float amplitude) {
+    uint8_t gain;
+    int ret = 0;
+
+    /* also rejects NaN */
+    if (!(amplitude > 0.0f && amplitude <= 1.0f))
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
+
+    gain = static_cast<uint8_t>(std::lround(amplitude * AW_GAIN_MAX));
+    if (gain < 1)
+        gain = 1;
+
+    {
+        std::lock_guard<std::mutex> lock(mAwLock);
+        mAwAmplitudeGain = gain;
+        /* applies from the next on(), or right away while one plays */
+        if (mAwOnActive)
+            ret = ledVib.awSetGain(gain);
+    }
+
+    if (ret < 0)
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
+    return ndk::ScopedAStatus::ok();
+}
+
+/*
+ * Compositions are timed here, one RAM waveform per primitive: the chip's
+ * sequencer slots cannot hold silences through the driver ("seq" only accepts
+ * waveform numbers), and the gain is one register, so per-primitive scale and
+ * delays need a trigger each.
+ */
+ndk::ScopedAStatus Vibrator::awCompose(const std::vector<CompositeEffect>& composite,
+                                       const std::shared_ptr<IVibratorCallback>& callback) {
+    AwJob job;
+
+    if (composite.empty() || composite.size() > static_cast<size_t>(ComposeSizeMax))
+        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
+
+    for (const CompositeEffect& e : composite) {
+        const AwPrimitive *p = awFindPrimitive(e.primitive);
+        AwStep step = {};
+
+        if (e.delayMs < 0 || e.delayMs > ComposeDelayMaxMs)
+            return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
+        /* also rejects NaN */
+        if (!(e.scale >= 0.0f && e.scale <= 1.0f))
+            return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
+        if (p == nullptr)
+            return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+
+        step.delayMs = e.delayMs;
+        step.gain = static_cast<uint8_t>(std::lround(e.scale * p->fullGain));
+        /* NOOP or scale 0: keep the timing, play nothing */
+        step.wave = step.gain != 0 ? p->wave : 0;
+        step.lengthMs = awWavePlayMs(p->wave);
+        job.steps.push_back(step);
+    }
+
+    job.useAmplitude = false;
+    job.stopAtEnd = false;
+    job.callback = callback;
+    ALOGD("AwVibrator compose %zu primitives", composite.size());
+    awSubmit(job);
+
     return ndk::ScopedAStatus::ok();
 }
 

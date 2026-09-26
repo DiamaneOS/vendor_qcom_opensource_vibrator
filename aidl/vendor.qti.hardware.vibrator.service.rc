@@ -2,10 +2,12 @@ on late-init
     chown system system /sys/class/qcom-haptics/primitive_duration
     chmod 0600 /sys/class/qcom-haptics/primitive_duration
 
+# No input group: with the Awinic vibrator (FP6) the HAL uses only its sysfs
+# nodes and does not open input devices (see InputFFDevice()).
 service vendor.qti.vibrator /vendor/bin/hw/vendor.qti.hardware.vibrator.service
     class hal
     user system
-    group system input
+    group system
 
 on late-init
     write /sys/class/leds/vibrator/trigger "transient"
