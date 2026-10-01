@@ -118,7 +118,7 @@ static constexpr int32_t ComposeSizeMax = 256;
 static constexpr int32_t kAwWaveMs[AW_RAM_WAVE_NUM + 1] = { 0, 30, 23, 15, 5 };
 
 /*
- * Tuning table, set by the owner's feel test on the FP6 (2026-09-26): wave 3 is
+ * Tuning table, set by feel test on the FP6 (2026-09-26): wave 3 is
  * the tick (light 0x18 for slider steps, medium 0x40 for the keyboard); waves 2
  * and 1 feel alike and wave 1 at full gain feels cheap, so clicks, heavy clicks
  * and thuds use wave 2 and wave 1 is not used for taps.
