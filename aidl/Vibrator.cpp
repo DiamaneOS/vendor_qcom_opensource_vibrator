@@ -1384,6 +1384,8 @@ ndk::ScopedAStatus Vibrator::awOff() {
         }
         mAwGeneration++;
         mAwOnActive = false;
+        /* IVibrator: off() also clears the amplitude set by setAmplitude() */
+        mAwAmplitudeGain = AW_GAIN_MAX;
         /* always written, whatever the HAL believes the motor is doing */
         ret = ledVib.off();
         mAwStopped = true;
