@@ -107,12 +107,6 @@ static constexpr int32_t ComposeSizeMax = 256;
 #define AW_GAIN_MAX             0x80
 /* The driver starts a waveform from its work queue, a few ms after the trigger */
 #define AW_TRIGGER_MARGIN_MS    5
-/*
- * on() up to this long plays one RAM waveform, longer ones loop AW_LOOP_WAVE.
- * Any positive on() length is accepted, as before: the driver timer takes an
- * int of ms and the HAL stops the loop at the end as well.
- */
-#define AW_SHORT_ON_MAX_MS      50
 
 /* Waveform lengths in ms, rounded up; index 0 = no waveform */
 static constexpr int32_t kAwWaveMs[AW_RAM_WAVE_NUM + 1] = { 0, 30, 23, 15, 5 };
@@ -1390,6 +1384,8 @@ ndk::ScopedAStatus Vibrator::awOff() {
         }
         mAwGeneration++;
         mAwOnActive = false;
+        /* IVibrator: off() also clears the amplitude set by setAmplitude() */
+        mAwAmplitudeGain = AW_GAIN_MAX;
         /* always written, whatever the HAL believes the motor is doing */
         ret = ledVib.off();
         mAwStopped = true;
@@ -1413,22 +1409,26 @@ ndk::ScopedAStatus Vibrator::awOn(int32_t timeoutMs,
     if (timeoutMs <= 0)
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
 
-    if (timeoutMs <= AW_SHORT_ON_MAX_MS) {
-        /*
-         * A short pulse plays the shortest RAM waveform that covers it, or
-         * wave 2 above its length (boost mode, crisper than a few looped
-         * cycles). Completion is reported once both the request and the
-         * waveform are over.
-         */
-        step.wave = 2;
-        for (uint8_t wave : shortWaves) {
-            if (kAwWaveMs[wave] >= timeoutMs) {
-                step.wave = wave;
-                break;
-            }
+    for (uint8_t wave : shortWaves) {
+        if (kAwWaveMs[wave] >= timeoutMs) {
+            step.wave = wave;
+            break;
         }
+    }
+    if (step.wave != 0) {
+        /*
+         * A short pulse plays the shortest RAM waveform that covers it (boost
+         * mode, crisper than a few looped cycles). Completion is reported once
+         * both the request and the waveform are over.
+         */
         step.lengthMs = std::max(timeoutMs, awWavePlayMs(step.wave));
     } else {
+        /*
+         * No RAM waveform is that long: loop the one-cycle waveform for the
+         * requested time, as on() asks. Any positive length is accepted: the
+         * driver timer takes an int of ms and the HAL stops the loop at the end
+         * as well.
+         */
         step.wave = AW_LOOP_WAVE;
         step.loop = true;
         step.lengthMs = timeoutMs;
