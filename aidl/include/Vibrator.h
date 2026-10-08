@@ -34,13 +34,31 @@
 #pragma once
 
 #include <aidl/android/hardware/vibrator/BnVibrator.h>
+#include <condition_variable>
 #include <thread>
 #include <mutex>
+#include <vector>
 
 namespace aidl {
 namespace android {
 namespace hardware {
 namespace vibrator {
+
+/* One step of an Awinic RAM playback job (see Vibrator.cpp) */
+struct AwStep {
+    int32_t delayMs;    /* silence before the step */
+    uint8_t wave;       /* RAM waveform, 0 = silent step */
+    uint8_t gain;       /* chip gain, unless the job follows setAmplitude() */
+    bool loop;          /* loop the one-cycle waveform for lengthMs (on()) */
+    int32_t lengthMs;   /* time the step takes once started */
+};
+
+struct AwJob {
+    std::vector<AwStep> steps;
+    bool useAmplitude = false;  /* on(): the gain follows setAmplitude() */
+    bool stopAtEnd = false;     /* stop the motor explicitly when the job ends */
+    std::shared_ptr<IVibratorCallback> callback;
+};
 
 class InputFFDevice {
 public:
@@ -68,10 +86,14 @@ public:
     LedVibratorDevice();
     int on(int32_t timeoutMs);
     int off();
+    int awPlayRam(uint8_t wave, uint8_t gain);
+    int awPlayLoop(int32_t timeoutMs, uint8_t gain);
+    int awSetGain(uint8_t gain);
     bool mDetected;
     uint8_t vibrator_dev;
 private:
     int write_value(const char *file, const char *value);
+    int aw_write(const char *node, const char *value);
 };
 
 class OffloadGlinkConnection {
@@ -144,6 +166,29 @@ private:
     int epollfd;
     int pipefd[2];
     std::atomic<bool> inComposition;
+
+    /* Awinic RAM waveform playback (ledVib with VIB_AW) */
+    bool isAw();
+    ndk::ScopedAStatus awOff();
+    ndk::ScopedAStatus awOn(int32_t timeoutMs,
+            const std::shared_ptr<IVibratorCallback>& callback);
+    ndk::ScopedAStatus awPerform(Effect effect, EffectStrength strength,
+            const std::shared_ptr<IVibratorCallback>& callback, int32_t* _aidl_return);
+    ndk::ScopedAStatus awSetAmplitude(float amplitude);
+    ndk::ScopedAStatus awCompose(const std::vector<CompositeEffect>& composite,
+            const std::shared_ptr<IVibratorCallback>& callback);
+    void awSubmit(AwJob& job);
+    static void awPlayThread(Vibrator *vibrator);
+    std::thread mAwThread;
+    std::mutex mAwLock;             /* guards the fields below and every aw sysfs write */
+    std::condition_variable mAwCv;
+    AwJob mAwJob;                   /* next job, taken by awPlayThread */
+    bool mAwJobQueued;
+    uint64_t mAwGeneration;         /* bumped by each new job and by off() */
+    bool mAwOnActive;               /* an on() job is playing: setAmplitude writes the gain */
+    bool mAwStopped;                /* motor stopped and nothing triggered since */
+    uint8_t mAwAmplitudeGain;
+    bool mAwExit;
 };
 
 }  // namespace vibrator
