@@ -96,7 +96,7 @@ static constexpr int32_t ComposeSizeMax = 256;
 
 /*
  * Awinic haptics (aw_vibrator, e.g. FP6). Effects play the fixed waveforms in
- * the chip RAM (/vendor/firmware/haptic_ram.bin, 24 kHz, f0 ~234 Hz); RTP
+ * the chip RAM (/vendor/firmware/haptic_ram.bin, 24 kHz, f0 ~234 Hz). RTP
  * (streamed waveforms) is not used.
  *   wave 1: 29.8 ms (~7 cycles)    wave 2: 22.2 ms (~5 cycles)
  *   wave 3: 14.5 ms (~3.5 cycles)  wave 4:  4.3 ms (one cycle, looped by on())
@@ -108,17 +108,17 @@ static constexpr int32_t ComposeSizeMax = 256;
 /* The driver starts a waveform from its work queue, a few ms after the trigger */
 #define AW_TRIGGER_MARGIN_MS    5
 
-/* Waveform lengths in ms, rounded up; index 0 = no waveform */
+/* Waveform lengths in ms, rounded up. Index 0 = no waveform */
 static constexpr int32_t kAwWaveMs[AW_RAM_WAVE_NUM + 1] = { 0, 30, 23, 15, 5 };
 
 /*
  * Tuning table, set by feel test on the FP6: wave 3 is
- * the tick (light 0x18 for slider steps, medium 0x40 for the keyboard); waves 2
+ * the tick (light 0x18 for slider steps, medium 0x40 for the keyboard). Waves 2
  * and 1 feel alike and wave 1 at full gain feels cheap, so clicks, heavy clicks
  * and thuds use wave 2 and wave 1 is not used for taps.
  * Adjust by feel: the RAM waveform each effect plays and its gain
  * for EffectStrength LIGHT, MEDIUM and STRONG (touch feedback follows the
- * user's vibration intensity setting; MEDIUM is the default). repeatGapMs > 0
+ * user's vibration intensity setting, MEDIUM by default). repeatGapMs > 0
  * plays the waveform again after that much silence.
  * Composition primitives use the second table: gain = scale * fullGain.
  */
@@ -150,7 +150,7 @@ static constexpr AwPrimitive kAwPrimitives[] = {
     /* primitive                       wave  fullGain */
     { CompositePrimitive::NOOP,          0,  0x00 },
     /* The keyboard composes CLICK at config_keyboardHapticFeedbackFixedAmplitude
-       (0.5 in the FP6 overlay: 0x40, the medium tick); SystemUI slider steps
+       (0.5 in the FP6 overlay: 0x40, the medium tick). SystemUI slider steps
        compose PRIMITIVE_TICK at 0.5 (0x18, the light tick). */
     { CompositePrimitive::CLICK,         3,  0x80 },
     { CompositePrimitive::LIGHT_TICK,    3,  0x30 },    /* Java PRIMITIVE_TICK */
@@ -584,7 +584,7 @@ int LedVibratorDevice::awSetGain(uint8_t gain) {
 
 /*
  * Play one RAM waveform once. Writing "brightness" puts the driver in RAM mode
- * (boost on) and plays sequencer slots from slot 0 until an empty slot; the
+ * (boost on) and plays sequencer slots from slot 0 until an empty slot. The
  * chip stops by itself at the end. Every slot used is rewritten here, so an
  * infinite loop count left in slot 0 by awPlayLoop() cannot carry over (RAM
  * mode has no driver timer).
@@ -719,7 +719,7 @@ int LedVibratorDevice::off()
          * Either write sets the driver state to 0, and its work then cancels
          * the loop timer and stops the chip. Both are written so that one
          * failing still stops the motor. The sequencer is not touched (the
-         * old "index" write here left slot 0 looping forever); awPlayRam()
+         * old "index" write here left slot 0 looping forever). awPlayRam()
          * rewrites every slot it plays before triggering.
          */
         ret = aw_write("activate", "0");
@@ -1273,7 +1273,7 @@ bool Vibrator::isAw() {
 /*
  * Awinic playback: every request (on, perform, compose) becomes a job of
  * steps that awPlayThread plays and times. A new job or off() bumps
- * mAwGeneration, which ends the current job at its next wait; that job then
+ * mAwGeneration, which ends the current job at its next wait. That job then
  * stops the motor and reports completion. All aw sysfs writes happen under
  * mAwLock, so a trigger can never land after the off() that should stop it.
  */
@@ -1353,8 +1353,8 @@ void Vibrator::awPlayThread(Vibrator *vibrator) {
         /*
          * A job cut short (a newer request, a failed write) may leave a
          * waveform playing, and a loop is stopped here besides the driver
-         * timer. A RAM sequence that played to its end has already stopped;
-         * after off() the motor is stopped already.
+         * timer. A RAM sequence that played to its end has already stopped.
+         * After off() the motor is stopped already.
          */
         if ((interrupted || job.stopAtEnd) && !vibrator->mAwStopped) {
             vibrator->ledVib.off();
@@ -1402,7 +1402,7 @@ ndk::ScopedAStatus Vibrator::awOff() {
 
 ndk::ScopedAStatus Vibrator::awOn(int32_t timeoutMs,
                                   const std::shared_ptr<IVibratorCallback>& callback) {
-    static const uint8_t shortWaves[] = { 3, 2 };    /* shortest first; wave 1 feels cheap */
+    static const uint8_t shortWaves[] = { 3, 2 };    /* shortest first. Wave 1 feels cheap */
     AwStep step = {};
     AwJob job;
 
